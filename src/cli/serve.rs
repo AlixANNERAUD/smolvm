@@ -38,7 +38,8 @@ EXAMPLES:
   smolvm serve start -l 0.0.0.0:9000                Listen on all interfaces, port 9000
   smolvm serve start -l unix:///tmp/smol.sock       Listen on a Unix domain socket
   smolvm serve start -v                             Enable verbose logging")]
-    Start(ServeStartCmd),
+    // Boxed: the server flags dwarf the other variant.
+    Start(Box<ServeStartCmd>),
 
     /// Export OpenAPI specification for SDK generation
     Openapi(OpenapiCmd),
@@ -47,7 +48,7 @@ EXAMPLES:
 impl ServeCmd {
     pub fn run(self) -> Result<()> {
         match self {
-            ServeCmd::Start(cmd) => cmd.run(),
+            ServeCmd::Start(cmd) => (*cmd).run(),
             ServeCmd::Openapi(cmd) => cmd.run(),
         }
     }
@@ -102,6 +103,12 @@ pub struct ServeStartCmd {
     /// directory, never by path. Unset: the API refuses cache disks.
     #[arg(long = "cache-disk-dir", value_name = "DIR")]
     cache_disk_dir: Option<std::path::PathBuf>,
+
+    /// Directory of local images the API may create machines from: `docker
+    /// save` / OCI archives and unpacked rootfs directories. A request's `image`
+    /// path must resolve inside it. Unset: the API accepts registry images only.
+    #[arg(long = "local-image-dir", value_name = "DIR")]
+    local_image_dir: Option<std::path::PathBuf>,
 
     /// Flag, or block, guest traffic to destinations on this watchlist. Each line
     /// is `<label> dns-sha256:<hex>` or `<label> ip-sha256:<hex>`: SHA-256 of a
@@ -461,6 +468,16 @@ impl ServeStartCmd {
             })?;
             println!("Cache disks enabled from {}", dir.display());
             state.set_cache_disk_dir(Some(dir));
+        }
+        if let Some(dir) = &self.local_image_dir {
+            let dir = dir.canonicalize().map_err(|e| {
+                smolvm::error::Error::config(
+                    "local image directory",
+                    format!("{}: {e}", dir.display()),
+                )
+            })?;
+            println!("Local images enabled from {}", dir.display());
+            state.set_local_image_dir(Some(dir));
         }
         if let Some(path) = &self.egress_watchlist {
             smolvm::agent::egress_watchlist::enable(path.clone())
