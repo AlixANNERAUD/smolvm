@@ -4113,8 +4113,11 @@ fn refresh_overlay_resolver(root: &Path) -> Result<()> {
 }
 
 fn overlay_resolv_conf_contents() -> String {
+    // Resolver options (`--dns-option`) ride on every file, the filter proxy's
+    // included: it answers on both UDP and TCP, so even `use-vc` works there.
+    let options = crate::resolv_options();
     if std::env::var(guest_env::DNS_FILTER).as_deref() == Ok("1") {
-        return "nameserver 127.0.0.1\n".to_string();
+        return smolvm_protocol::resolv::render(&["127.0.0.1"], &options);
     }
 
     // A nameserver supplied by the host (SMOLVM_NETWORK_DNS) wins for either
@@ -4122,12 +4125,14 @@ fn overlay_resolv_conf_contents() -> String {
     // custom resolver (--dns) the guest queries directly. Only fall back to
     // public resolvers when the host didn't specify one.
     if let Ok(dns_server) = std::env::var(guest_env::DNS) {
-        if !dns_server.is_empty() {
-            return format!("nameserver {}\n", dns_server);
+        if !dns_server.trim().is_empty() {
+            return smolvm_protocol::resolv::render(&[dns_server.trim()], &options);
         }
     }
 
-    "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string()
+    // Same order as the TSI boot path (`tsi_resolv_conf`): the two writers
+    // used to disagree (8.8.8.8 first here, 1.1.1.1 first at boot).
+    smolvm_protocol::resolv::render(&smolvm_protocol::resolv::DEFAULT_NAMESERVERS, &options)
 }
 
 /// Default /etc/hosts for images that ship without one, mirroring the file
@@ -7305,11 +7310,45 @@ mod tests {
         std::env::remove_var(guest_env::DNS_FILTER);
         std::env::remove_var(guest_env::BACKEND);
         std::env::remove_var(guest_env::DNS);
+        std::env::remove_var(guest_env::DNS_OPTIONS);
+
+        // Same order as the TSI boot repair (`tsi_resolv_conf`).
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+        );
+    }
+
+    #[test]
+    fn overlay_resolv_conf_carries_resolver_options_on_every_path() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::BACKEND);
+        std::env::remove_var(guest_env::DNS);
+        std::env::set_var(
+            guest_env::DNS_OPTIONS,
+            "timeout:1 attempts:3 rotate use-vc bogus",
+        );
 
         assert_eq!(
             overlay_resolv_conf_contents(),
-            "nameserver 8.8.8.8\nnameserver 1.1.1.1\n"
+            "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:1 attempts:3 rotate use-vc\n"
         );
+        std::env::set_var(guest_env::DNS, "100.100.100.100");
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 100.100.100.100\noptions timeout:1 attempts:3 rotate use-vc\n"
+        );
+        // The filter proxy answers on UDP and TCP, so it gets the options too.
+        std::env::set_var(guest_env::DNS_FILTER, "1");
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 127.0.0.1\noptions timeout:1 attempts:3 rotate use-vc\n"
+        );
+
+        std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::DNS);
+        std::env::remove_var(guest_env::DNS_OPTIONS);
     }
 
     #[test]

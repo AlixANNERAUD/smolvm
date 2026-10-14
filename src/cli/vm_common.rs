@@ -470,6 +470,7 @@ pub struct CreateVmParams {
     pub net: bool,
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
+    pub dns_options: Vec<String>,
     pub network_name: Option<String>,
     /// Canonical `--guest-subnet` CIDR, when set.
     pub guest_subnet: Option<String>,
@@ -795,6 +796,7 @@ pub(crate) fn build_vm_record_for(
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
     record.dns = params.dns;
+    record.dns_options = params.dns_options.clone();
     record.network_name = params.network_name.clone();
     record.guest_subnet = params.guest_subnet.clone();
     record.gpu = if params.gpu { Some(true) } else { None };
@@ -2147,6 +2149,7 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.network = o.network;
     r.network_backend = o.network_backend;
     r.dns = o.dns;
+    r.dns_options = o.dns_options.clone();
     r.network_name = o.network_name.clone();
     r.guest_subnet = o.guest_subnet.clone();
     r.storage_gb = o.storage_gb;
@@ -2223,6 +2226,7 @@ pub struct DefaultVmOverrides {
     pub network: bool,
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
+    pub dns_options: Vec<String>,
     pub network_name: Option<String>,
     pub guest_subnet: Option<String>,
     pub storage_gb: Option<u64>,
@@ -2278,6 +2282,7 @@ impl DefaultVmOverrides {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            dns_options: params.dns_options.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
             storage_gb: params.storage_gb,
@@ -3268,6 +3273,14 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
     }
     if let Some(cidrs) = &record.allowed_cidrs {
         fields.insert("allowed_cidrs".into(), serde_json::json!(cidrs));
+    }
+    // The guest resolver and its options, present only when set (`--dns`,
+    // `--dns-option`), so tooling can see what the guest resolv.conf gets.
+    if let Some(dns) = record.dns {
+        fields.insert("dns".into(), serde_json::json!(dns.to_string()));
+    }
+    if !record.dns_options.is_empty() {
+        fields.insert("dns_options".into(), serde_json::json!(record.dns_options));
     }
     // A branch keeps its staged working copies but never writes them back;
     // name the machine that does, so tooling can send the user there.
@@ -4618,5 +4631,29 @@ mod mount_socket_placeholder_tests {
             vec![mount_sock("/run/control/engine.sock")],
         );
         remove_placeholders(&record); // nothing present: no failure
+    }
+}
+
+#[cfg(test)]
+mod status_dns_tests {
+    use super::machine_status_json;
+    use smolvm::config::VmRecord;
+
+    // `--dns` and `--dns-option` show up in status JSON only when set, so the
+    // object other machines produce is unchanged.
+    #[test]
+    fn status_json_reports_resolver_and_options_only_when_set() {
+        let mut record = VmRecord::new("d".to_string(), 1, 512, vec![], vec![], true);
+        let plain = machine_status_json("d", &record);
+        assert!(plain.get("dns").is_none() && plain.get("dns_options").is_none());
+
+        record.dns = Some("9.9.9.9".parse().unwrap());
+        record.dns_options = vec!["timeout:1".into(), "use-vc".into()];
+        let status = machine_status_json("d", &record);
+        assert_eq!(status["dns"], "9.9.9.9");
+        assert_eq!(
+            status["dns_options"],
+            serde_json::json!(["timeout:1", "use-vc"])
+        );
     }
 }
