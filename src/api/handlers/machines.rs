@@ -985,6 +985,18 @@ pub struct CaptureCheckpointQuery {
     /// chunked file, and a delta of the checkpoint the machine continues from
     /// when this node holds it.
     pub incremental: Option<bool>,
+    /// With `incremental`: export a complete file even when a base is held,
+    /// so a caller can cap the chain of deltas a restore imports.
+    pub force_full: Option<bool>,
+    /// With a `cache_key`: reply as soon as the artifact is captured and held
+    /// on this node, and leave its upload to `POST /checkpoints/{key}/upload`.
+    /// Uploading a multi-gigabyte artifact took most of a checkpoint's time
+    /// while the caller only needed the capture, which a restore on this node
+    /// already serves from the node's copy. A caller may pass `upload_urls`
+    /// as well: this node ignores them, and a node that predates
+    /// `defer_upload` ignores it instead and uploads inline, so one request
+    /// works on both and the reply (`captured` or `uploaded`) says which ran.
+    pub defer_upload: Option<bool>,
 }
 
 /// Capture a live checkpoint of a running machine and stream it back as a
@@ -1011,6 +1023,15 @@ pub async fn capture_portable_checkpoint(
         .as_deref()
         .map(checked_upload_urls)
         .transpose()?;
+    let defer_upload = capture_options.defer_upload.unwrap_or(false);
+    if defer_upload {
+        let Some(key) = capture_options.cache_key.as_deref() else {
+            return Err(ApiError::BadRequest(
+                "defer_upload needs a cache_key to upload the artifact by later".into(),
+            ));
+        };
+        pending_checkpoint_upload_path(key)?;
+    }
 
     let mut transfer_builder = tempfile::Builder::new();
     transfer_builder.prefix("checkpoint-transfer-");
@@ -1032,12 +1053,16 @@ pub async fn capture_portable_checkpoint(
             .unwrap_or_else(crate::portable_checkpoint::prepared_checkpoint_budget)
     });
     let incremental = capture_options.incremental.unwrap_or(false);
+    let force_full = capture_options.force_full.unwrap_or(false);
     // Keep staging alive until the background capture finishes, even on disconnect.
     let (transfer, result) = with_owned_transfer(transfer, move |_dir| {
         if incremental {
-            return crate::checkpoint_delta::capture(&capture_name, &capture_path, move || {
-                drop(guard)
-            })
+            return crate::checkpoint_delta::capture(
+                &capture_name,
+                &capture_path,
+                force_full,
+                move || drop(guard),
+            )
             .map(|capture| (capture.result.clone(), None, Some(capture)));
         }
         crate::portable_checkpoint::capture_to_path_deferring_retention(
@@ -1106,22 +1131,49 @@ pub async fn capture_portable_checkpoint(
     };
 
     if let Some(key) = capture_options.cache_key {
-        let artifact = artifact.clone();
+        let cached = key.clone();
+        let source = artifact.clone();
         if let Err(error) =
-            tokio::task::spawn_blocking(move || checkpoint_cache_put(&key, &artifact)).await
+            tokio::task::spawn_blocking(move || checkpoint_cache_put(&cached, &source)).await
         {
             tracing::warn!(%error, "checkpoint cache task failed");
+        }
+        if defer_upload {
+            let source = artifact.clone();
+            tokio::task::spawn_blocking(move || hold_checkpoint_for_upload(&key, &source))
+                .await
+                .map_err(|error| {
+                    ApiError::internal(format!("hold checkpoint for upload: {error}"))
+                })??;
+            let size = match &incremental {
+                Some(capture) => capture.export.bytes,
+                None => result.size_bytes,
+            };
+            finish(transfer);
+            return Ok(axum::response::IntoResponse::into_response(Json(
+                with_lineage(
+                    serde_json::json!({
+                        "captured": true,
+                        "sizeBytes": size,
+                        "pauseMs": result.source_pause.as_millis() as u64,
+                    }),
+                    incremental.as_ref(),
+                ),
+            )));
         }
     }
     if let Some(urls) = upload_urls {
         let size = upload_checkpoint(&artifact, urls).await?;
         finish(transfer);
         return Ok(axum::response::IntoResponse::into_response(Json(
-            serde_json::json!({
-                "uploaded": true,
-                "sizeBytes": size,
-                "pauseMs": result.source_pause.as_millis() as u64,
-            }),
+            with_lineage(
+                serde_json::json!({
+                    "uploaded": true,
+                    "sizeBytes": size,
+                    "pauseMs": result.source_pause.as_millis() as u64,
+                }),
+                incremental.as_ref(),
+            ),
         )));
     }
     #[cfg(target_os = "linux")]
@@ -1197,6 +1249,126 @@ fn upload_part_ranges(size: u64, parts: usize) -> Vec<(u64, u64)> {
             (start, part_size.min(size - start))
         })
         .collect()
+}
+
+/// Captured artifacts waiting for `POST /checkpoints/{key}/upload`. Kept apart
+/// from the checkpoint cache, whose eviction could drop one before its upload
+/// runs; an upload removes its entry, and one never uploaded is swept after a
+/// day.
+fn pending_checkpoint_upload_dir() -> Result<std::path::PathBuf, ApiError> {
+    let dir = checkpoint_transfer_root()?.join("checkpoint-pending-upload");
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        ApiError::internal(format!("create pending checkpoint uploads: {error}"))
+    })?;
+    Ok(dir)
+}
+
+fn pending_checkpoint_upload_path(key: &str) -> Result<std::path::PathBuf, ApiError> {
+    let cached = checkpoint_cache_path(key)?;
+    let name = cached
+        .file_name()
+        .ok_or_else(|| ApiError::internal("checkpoint cache path has no name"))?;
+    Ok(pending_checkpoint_upload_dir()?.join(name))
+}
+
+/// How long a captured artifact waits for its upload before it is swept.
+const PENDING_CHECKPOINT_UPLOAD_TTL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Hold `artifact` for a later upload under `key`, sweeping holds never
+/// uploaded. A hard link, so the capture's own staging can go.
+fn hold_checkpoint_for_upload(key: &str, artifact: &std::path::Path) -> Result<(), ApiError> {
+    let destination = pending_checkpoint_upload_path(key)?;
+    hold_checkpoint_at(&destination, artifact)
+        .map_err(|error| ApiError::internal(format!("hold checkpoint for upload: {error}")))
+}
+
+/// Link `artifact` to `destination` in the pending-upload directory, after
+/// removing holds there older than [`PENDING_CHECKPOINT_UPLOAD_TTL`].
+fn hold_checkpoint_at(
+    destination: &std::path::Path,
+    artifact: &std::path::Path,
+) -> std::io::Result<()> {
+    let dir = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("hold path has no parent"))?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| {
+                    now.duration_since(modified).unwrap_or_default() > PENDING_CHECKPOINT_UPLOAD_TTL
+                });
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    link_checkpoint_cache_alias(artifact, destination, true)
+}
+
+/// Options for uploading a held checkpoint.
+#[derive(Debug, serde::Deserialize)]
+pub struct UploadHeldCheckpointQuery {
+    /// JSON array of pre-signed object-store URLs, one contiguous part each.
+    pub upload_urls: String,
+}
+
+/// Upload a checkpoint captured with `defer_upload` to pre-signed object-store
+/// URLs, then release the node's hold on it. The node's cached copy is the
+/// fallback when the hold is gone.
+pub async fn upload_held_checkpoint(
+    Path(key): Path<String>,
+    Query(query): Query<UploadHeldCheckpointQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let urls = checked_upload_urls(&query.upload_urls)?;
+    let held = pending_checkpoint_upload_path(&key)?;
+    let source = if held.exists() {
+        held.clone()
+    } else {
+        let cached = checkpoint_cache_path(&key)?;
+        if !cached.exists() {
+            return Err(ApiError::NotFound(format!(
+                "checkpoint {key} is not held on this node"
+            )));
+        }
+        cached
+    };
+    let size = upload_checkpoint(&source, urls).await?;
+    if source == held {
+        let _ = std::fs::remove_file(&held);
+    }
+    Ok(Json(
+        serde_json::json!({ "uploaded": true, "sizeBytes": size }),
+    ))
+}
+
+/// An incremental capture's lineage in a JSON reply, which the streamed reply
+/// carries as `x-smolvm-checkpoint-*` headers: whether the artifact is a delta,
+/// the checkpoint's lineage id, and the base a delta needs imported first.
+fn with_lineage(
+    mut reply: serde_json::Value,
+    capture: Option<&crate::checkpoint_delta::IncrementalCapture>,
+) -> serde_json::Value {
+    if let (Some(capture), Some(fields)) = (capture, reply.as_object_mut()) {
+        fields.insert(
+            "checkpointKind".into(),
+            if capture.base.is_some() {
+                "delta"
+            } else {
+                "full"
+            }
+            .into(),
+        );
+        fields.insert("lineageId".into(), capture.id.clone().into());
+        if let Some(base) = &capture.base {
+            fields.insert("baseLineageId".into(), base.clone().into());
+        }
+        fields.insert("reusedBytes".into(), capture.result.reused_bytes.into());
+    }
+    reply
 }
 
 fn checked_upload_urls(raw: &str) -> Result<Vec<reqwest::Url>, ApiError> {
@@ -1482,6 +1654,46 @@ mod checkpoint_upload_tests {
         assert!(checked_upload_urls(r#"["https://169.254.169.254/latest"]"#).is_err());
         assert!(checked_upload_urls(r#"["http://storage.googleapis.com/o"]"#).is_err());
         assert!(checked_upload_urls("not json").is_err());
+    }
+}
+
+#[cfg(test)]
+mod held_checkpoint_tests {
+    use super::{hold_checkpoint_at, PENDING_CHECKPOINT_UPLOAD_TTL};
+
+    /// A deferred capture holds its artifact apart from the cache, so cache
+    /// eviction cannot drop it before the upload, and a hold never uploaded is
+    /// swept rather than kept forever.
+    #[test]
+    fn a_hold_survives_its_source_and_stale_holds_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = dir.path().join("pending");
+        std::fs::create_dir_all(&pending).unwrap();
+        let stale = pending.join("ckpt-old.smolcheckpoint");
+        std::fs::write(&stale, b"old").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - PENDING_CHECKPOINT_UPLOAD_TTL
+                    - std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        let fresh = pending.join("ckpt-recent.smolcheckpoint");
+        std::fs::write(&fresh, b"recent").unwrap();
+
+        let artifact = dir.path().join("staging.smolcheckpoint");
+        std::fs::write(&artifact, b"captured").unwrap();
+        let held = pending.join("ckpt-new.smolcheckpoint");
+        hold_checkpoint_at(&held, &artifact).unwrap();
+        // The capture's staging goes away; the hold keeps the bytes.
+        std::fs::remove_file(&artifact).unwrap();
+
+        assert_eq!(std::fs::read(&held).unwrap(), b"captured");
+        assert!(!stale.exists(), "a hold past its TTL is swept");
+        assert!(fresh.exists(), "a recent hold is kept");
     }
 }
 
