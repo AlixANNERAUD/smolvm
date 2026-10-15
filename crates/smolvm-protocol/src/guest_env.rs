@@ -94,6 +94,11 @@ pub const GATEWAY: &str = "SMOLVM_NETWORK_GATEWAY";
 pub const PREFIX_LEN: &str = "SMOLVM_NETWORK_PREFIX_LEN";
 /// Guest MAC address in colon-separated string form.
 pub const GUEST_MAC: &str = "SMOLVM_NETWORK_GUEST_MAC";
+/// Gateway MAC address in colon-separated string form. Optional: set when the
+/// CNI pre-programs the gateway as a static neighbor entry
+/// so nothing answers ARP on the link, and the guest must install the entry
+/// itself rather than resolve it.
+pub const GATEWAY_MAC: &str = "SMOLVM_NETWORK_GATEWAY_MAC";
 /// Guest IPv6 (ULA) address. Optional: absent means IPv4-only guest config.
 pub const GUEST_IP6: &str = "SMOLVM_NETWORK_GUEST_IP6";
 /// Guest-visible default gateway IPv6 address.

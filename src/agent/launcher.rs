@@ -2373,6 +2373,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             guest_network,
             resources.dns,
             &resources.dns_options,
+            pod_net.as_ref().and_then(|p| p.gateway_mac),
         ));
 
         // Tell the agent about pre-extracted packed layers

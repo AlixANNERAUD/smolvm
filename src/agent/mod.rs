@@ -199,6 +199,7 @@ pub(crate) fn guest_network_env(
     guest_network: Option<smolvm_network::GuestNetworkConfig>,
     dns_override: Option<std::net::Ipv4Addr>,
     dns_options: &[String],
+    gateway_mac: Option<[u8; 6]>,
 ) -> Vec<std::ffi::CString> {
     use smolvm_protocol::guest_env;
     let mut env: Vec<std::ffi::CString> = Vec::new();
@@ -214,6 +215,13 @@ pub(crate) fn guest_network_env(
         push(guest_env::GATEWAY, n.gateway_ip.to_string());
         push(guest_env::PREFIX_LEN, n.prefix_len.to_string());
         push(guest_env::GUEST_MAC, format_mac(n.guest_mac));
+        // Pod-networking only: CNIs that pre-program the gateway as a static
+        // neighbor entry answer no ARP, so the guest must
+        // install the entry itself. The fabric path hands the guest no MAC and
+        // keeps resolving the gateway over ARP as before.
+        if let Some(gateway_mac) = gateway_mac {
+            push(guest_env::GATEWAY_MAC, format_mac(gateway_mac));
+        }
         // Only hand the guest an IPv6 identity when the host can actually
         // route v6: a global-scope guest address makes dual-stack clients
         // sort AAAA answers first (RFC 6724), and on a v6-less host every
@@ -303,13 +311,16 @@ mod guest_network_env_tests {
     #[test]
     fn dns_options_travel_in_order_only_when_set() {
         let options = ["timeout:1", "attempts:3", "rotate", "use-vc"].map(String::from);
-        let env = guest_network_env(None, None, &options);
+        let env = guest_network_env(None, None, &options, None);
         assert_eq!(
             value(&env, guest_env::DNS_OPTIONS).as_deref(),
             Some("timeout:1 attempts:3 rotate use-vc")
         );
         assert_eq!(
-            value(&guest_network_env(None, None, &[]), guest_env::DNS_OPTIONS),
+            value(
+                &guest_network_env(None, None, &[], None),
+                guest_env::DNS_OPTIONS
+            ),
             None
         );
     }
