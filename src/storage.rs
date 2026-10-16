@@ -1602,6 +1602,7 @@ mod clone_machine_disks_tests {
         path
     }
 
+    #[cfg(unix)]
     fn qcow2_header_with_backing(backing: &str) -> Vec<u8> {
         let offset: u64 = 72;
         let mut header = Vec::new();
