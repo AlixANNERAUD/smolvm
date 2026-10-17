@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -7,7 +8,14 @@ use crate::s3;
 
 pub struct Server {
     endpoint: String,
-    worker: JoinHandle<Vec<String>>,
+    completion: mpsc::Sender<()>,
+    worker: JoinHandle<Vec<CapturedRequest>>,
+}
+
+pub struct CapturedRequest {
+    pub line: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
 }
 
 impl Server {
@@ -15,6 +23,7 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (completion, finished) = mpsc::channel();
         let worker = thread::spawn(move || {
             let mut requests = Vec::new();
             for (method, path, status, body) in responses {
@@ -42,6 +51,7 @@ impl Server {
                 assert_eq!(parts[0], method, "{request}");
                 assert_eq!(parts[1].split('?').next().unwrap(), path, "{request}");
                 let mut length = 0;
+                let mut headers = Vec::new();
                 loop {
                     let mut header = String::new();
                     assert!(reader.read_line(&mut header).unwrap() > 0);
@@ -52,19 +62,50 @@ impl Server {
                         if name.eq_ignore_ascii_case("content-length") {
                             length = value.trim().parse::<usize>().unwrap();
                         }
+                        headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
                     }
                 }
-                reader.read_exact(&mut vec![0; length]).unwrap();
+                let mut payload = vec![0; length];
+                reader.read_exact(&mut payload).unwrap();
                 let response = format!(
                     "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).unwrap();
-                requests.push(request.trim().to_string());
+                requests.push(CapturedRequest {
+                    line: request.trim().to_string(),
+                    headers,
+                    body: payload,
+                });
+            }
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut request = String::new();
+                        BufReader::new(&mut stream).read_line(&mut request).unwrap();
+                        panic!("unexpected request: {request}");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        match finished.try_recv() {
+                            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                            Err(mpsc::TryRecvError::Empty) => {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
             }
             requests
         });
-        Self { endpoint, worker }
+        Self {
+            endpoint,
+            completion,
+            worker,
+        }
     }
 
     pub fn client(&self, prefix: &str) -> s3::Client {
@@ -80,6 +121,14 @@ impl Server {
     }
 
     pub fn finish(self) -> Vec<String> {
+        self.finish_requests()
+            .into_iter()
+            .map(|request| request.line)
+            .collect()
+    }
+
+    pub fn finish_requests(self) -> Vec<CapturedRequest> {
+        let _ = self.completion.send(());
         self.worker.join().unwrap()
     }
 }

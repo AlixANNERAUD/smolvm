@@ -25,3 +25,24 @@ metadata-heavy traversal. Confirm it in the guest with
   the host process (1–4096); this bounds the number of host relay threads and
   their buffers. Invalid values use the default. TSI networking does not use
   this relay table.
+
+## S3 mounts
+
+S3 mounts are not a full POSIX workspace: symlinks are unsupported, and changes
+to ownership, permissions (including executable bits), and timestamps are not
+persisted. Copying a Git repository can therefore lose information even when
+all regular-file contents match.
+
+File renames use the provider's server-side `CopyObject` operation followed by
+source deletion, rather than downloading and reuploading the object. This
+requires `CopyObject` support and is subject to its single-request object-size
+limit; multipart copying and directory renames are not implemented. Renames
+are not atomic: a failed source deletion returns an error, but both names may
+exist. S3 errors embedded in a successful HTTP response are treated as errors
+before attempting source deletion.
+
+Writes are staged on the VM until a successful flush or fsync uploads them.
+S3 cannot recover writes lost with the VM before they reach that boundary.
+A separate reader can fail to read a newly staged file before its writer is
+flushed, including with the metadata cache disabled; flush or close the writer
+before reopening the file through another handle.
