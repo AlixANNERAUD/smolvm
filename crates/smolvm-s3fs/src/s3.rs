@@ -14,7 +14,7 @@ use crate::sigv4::{self, Credentials, SignRequest, EMPTY_SHA256, UNSIGNED_PAYLOA
 pub enum Error {
     /// Transport or TLS failure.
     Transport(String),
-    /// S3 answered with a non-2xx status; `code` is the parsed `<Code>` when present.
+    /// S3 reported an error, including errors embedded in a 2xx response.
     Status {
         status: u16,
         code: String,
@@ -289,6 +289,38 @@ impl Client {
         Ok(())
     }
 
+    pub fn copy(&self, from: &str, to: &str) -> Result<u64> {
+        let source = format!("/{}/{}", self.cfg.bucket, self.full_key(from));
+        let headers = vec![
+            (
+                "x-amz-copy-source".into(),
+                sigv4::uri_encode(&source, false),
+            ),
+            ("x-amz-metadata-directive".into(), "COPY".into()),
+            ("content-length".into(), "0".into()),
+        ];
+        let response = self.send("PUT", &self.full_key(to), &[], headers, Some(b""))?;
+        let body = response
+            .into_string()
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        if let Some(code) = xml_field(&body, "Code") {
+            return Err(Error::Status {
+                status: 200,
+                code,
+                message: xml_field(&body, "Message").unwrap_or_default(),
+            });
+        }
+        if !body.contains("<CopyObjectResult")
+            || !body.trim_end().ends_with("</CopyObjectResult>")
+            || xml_field(&body, "ETag").is_none_or(|etag| etag.is_empty())
+        {
+            return Err(Error::Parse("invalid copy response".into()));
+        }
+        xml_field(&body, "LastModified")
+            .and_then(|value| parse_iso8601(&value))
+            .ok_or_else(|| Error::Parse("copy response has no valid LastModified".into()))
+    }
+
     pub fn delete(&self, rel: &str) -> Result<()> {
         let key = self.full_key(rel);
         match self.send("DELETE", &key, &[], Vec::new(), None) {
@@ -508,6 +540,63 @@ fn parse_http_date(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_side_copy_encodes_the_source_and_signs_its_headers() {
+        let server = crate::test_support::Server::new(vec![(
+            "PUT",
+            "/b/mount/target%20%2B.txt",
+            200,
+            "<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>2013-05-24T00:00:00.000Z</LastModified><ETag>&quot;abc&quot;</ETag></CopyObjectResult>",
+        )]);
+        let mut cfg = server.client("mount").config().clone();
+        cfg.credentials = Some(Credentials {
+            access_key_id: "test-access".into(),
+            secret_access_key: "test-secret".into(),
+            session_token: None,
+        });
+        let client = Client::new(cfg);
+        assert_eq!(
+            client.copy("source +%?#é.txt", "target +.txt").unwrap(),
+            1369353600
+        );
+        let requests = server.finish_requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request.body.is_empty());
+        let header = |name| {
+            request
+                .headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .unwrap()
+                .1
+                .as_str()
+        };
+        assert_eq!(
+            header("x-amz-copy-source"),
+            "/b/mount/source%20%2B%25%3F%23%C3%A9.txt"
+        );
+        assert_eq!(header("x-amz-metadata-directive"), "COPY");
+        assert!(header("authorization").contains("x-amz-copy-source"));
+        assert!(header("authorization").contains("x-amz-metadata-directive"));
+    }
+
+    #[test]
+    fn copy_rejects_embedded_errors_and_invalid_success_bodies() {
+        for body in [
+            "<Error><Code>SlowDown</Code><Message>try again</Message></Error>",
+            "",
+            "<CopyObjectResult/>",
+            "<CopyObjectResult><ETag>abc</ETag><LastModified>invalid</LastModified></CopyObjectResult>",
+            "<CopyObjectResult><LastModified>2013-05-24T00:00:00.000Z</LastModified></CopyObjectResult>",
+            "<CopyObjectResult><ETag>abc</ETag><LastModified>2013-05-24T00:00:00.000Z</LastModified>",
+        ] {
+            let server = crate::test_support::Server::new(vec![("PUT", "/b/to", 200, body)]);
+            assert!(server.client("").copy("from", "to").is_err(), "{body}");
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
 
     #[test]
     fn a_directory_marker_survives_pagination_without_becoming_a_child() {

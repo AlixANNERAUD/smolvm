@@ -899,25 +899,37 @@ impl Filesystem for S3Fs {
                 };
                 let from = Self::join(&parent, &old_name);
                 let to = Self::join(&new_parent, &new_name);
-                let bytes = match self.client.get(&from, None) {
-                    Ok(b) => b,
-                    Err(_) => return Reply::Error(libc::ENOENT),
+                if from == to {
+                    return match self.stat(&from) {
+                        Some(_) => Reply::Ok,
+                        None => Reply::Error(libc::ENOENT),
+                    };
+                }
+                let source = self.known(&from);
+                let mtime = match self.client.copy(&from, &to) {
+                    Ok(mtime) => mtime,
+                    Err(s3::Error::Status { status: 404, .. }) => {
+                        return Reply::Error(libc::ENOENT);
+                    }
+                    Err(error) => {
+                        tracing::warn!(from, to, error = %error, "rename copy failed");
+                        return Reply::Error(libc::EIO);
+                    }
                 };
-                if self.client.put(&to, &bytes).is_err() {
+                self.forget_bytes(&to);
+                if let Ok(mut meta) = self.meta.lock() {
+                    meta.remove(&to);
+                }
+                if let Err(error) = self.client.delete(&from) {
+                    tracing::warn!(from, to, error = %error, "rename source delete failed");
                     return Reply::Error(libc::EIO);
                 }
-                let _ = self.client.delete(&from);
                 self.rename_path(&from, &to);
                 self.forget_bytes(&from);
-                self.forget_bytes(&to);
                 self.remember(&from, Known::Absent);
-                self.remember(
-                    &to,
-                    Known::Present(Node::File {
-                        size: bytes.len() as u64,
-                        mtime: Self::now(),
-                    }),
-                );
+                if let Some(Known::Present(Node::File { size, .. })) = source {
+                    self.remember(&to, Known::Present(Node::File { size, mtime }));
+                }
                 Reply::Ok
             }
 
@@ -945,6 +957,140 @@ impl Filesystem for S3Fs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const COPIED_OBJECT: &str = "<CopyObjectResult><ETag>&quot;abc&quot;</ETag><LastModified>2013-05-24T00:00:00.000Z</LastModified></CopyObjectResult>";
+
+    fn rename(fs: &S3Fs, from: &str, to: &str) -> Reply {
+        let mut data = FUSE_ROOT_ID.to_ne_bytes().to_vec();
+        data.extend_from_slice(from.as_bytes());
+        data.push(0);
+        data.extend_from_slice(to.as_bytes());
+        data.push(0);
+        fs.dispatch(&Request {
+            opcode: fuse::op::RENAME,
+            unique: 1,
+            nodeid: FUSE_ROOT_ID,
+            uid: 0,
+            gid: 0,
+            data: &data,
+        })
+    }
+
+    #[test]
+    fn rename_copies_without_transferring_payload_and_preserves_the_inode() {
+        let server = crate::test_support::Server::new(vec![
+            ("PUT", "/b/to", 200, COPIED_OBJECT),
+            ("DELETE", "/b/from", 204, ""),
+        ]);
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        fs.remember(
+            "from",
+            Known::Present(Node::File {
+                size: 1_000_000_000,
+                mtime: 1,
+            }),
+        );
+        fs.remember("to", Known::Present(Node::File { size: 1, mtime: 2 }));
+        let source_ino = fs.ino_for("from");
+        let replaced_ino = fs.ino_for("to");
+        for path in ["from", "to"] {
+            fs.small.lock().unwrap().insert(
+                path.into(),
+                SmallFile {
+                    size: 1,
+                    mtime: 2,
+                    bytes: std::sync::Arc::new(vec![0]),
+                    fetched: Instant::now(),
+                    used: Instant::now(),
+                },
+            );
+        }
+        assert!(matches!(rename(&fs, "from", "to"), Reply::Ok));
+        assert_eq!(fs.path_of(source_ino).as_deref(), Some("to"));
+        assert!(fs.path_of(replaced_ino).is_none());
+        assert_eq!(fs.known("from"), Some(Known::Absent));
+        assert!(fs.small.lock().unwrap().is_empty());
+        assert_eq!(
+            fs.stat("to"),
+            Some(Node::File {
+                size: 1_000_000_000,
+                mtime: 1369353600
+            })
+        );
+        let requests = server.finish_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.body.is_empty()));
+    }
+
+    #[test]
+    fn rename_copy_failures_never_delete_the_source() {
+        for (status, body, errno) in [
+            (403, "<Error><Code>AccessDenied</Code></Error>", libc::EIO),
+            (404, "<Error><Code>NoSuchKey</Code></Error>", libc::ENOENT),
+            (500, "<Error><Code>InternalError</Code></Error>", libc::EIO),
+            (200, "<Error><Code>InternalError</Code></Error>", libc::EIO),
+            (200, "<CopyObjectResult/>", libc::EIO),
+        ] {
+            let server = crate::test_support::Server::new(vec![("PUT", "/b/to", status, body)]);
+            let mut fs = fs_with_ttl(Duration::from_secs(60));
+            fs.client = server.client("");
+            let source_ino = fs.ino_for("from");
+            assert!(matches!(rename(&fs, "from", "to"), Reply::Error(error) if error == errno));
+            assert_eq!(fs.path_of(source_ino).as_deref(), Some("from"));
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn rename_delete_failure_reports_an_error_and_invalidates_the_destination() {
+        let server = crate::test_support::Server::new(vec![
+            ("PUT", "/b/to", 200, COPIED_OBJECT),
+            (
+                "DELETE",
+                "/b/from",
+                403,
+                "<Error><Code>AccessDenied</Code></Error>",
+            ),
+        ]);
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        fs.remember("from", Known::Present(Node::File { size: 3, mtime: 1 }));
+        fs.remember("to", Known::Present(Node::File { size: 1, mtime: 2 }));
+        let source_ino = fs.ino_for("from");
+        assert!(matches!(rename(&fs, "from", "to"), Reply::Error(libc::EIO)));
+        assert_eq!(fs.path_of(source_ino).as_deref(), Some("from"));
+        assert!(matches!(fs.known("from"), Some(Known::Present(_))));
+        assert_eq!(fs.known("to"), None);
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn rename_without_cached_source_drops_stale_destination_metadata() {
+        let server = crate::test_support::Server::new(vec![
+            ("PUT", "/b/to", 200, COPIED_OBJECT),
+            ("DELETE", "/b/from", 204, ""),
+        ]);
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        fs.remember("to", Known::Absent);
+        assert!(matches!(rename(&fs, "from", "to"), Reply::Ok));
+        assert_eq!(fs.known("to"), None);
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn rename_to_the_same_path_leaves_the_object_alone() {
+        let fs = fs_with_ttl(Duration::from_secs(60));
+        fs.remember("from", Known::Present(Node::File { size: 3, mtime: 1 }));
+        assert!(matches!(rename(&fs, "from", "from"), Reply::Ok));
+        assert!(matches!(fs.known("from"), Some(Known::Present(_))));
+        fs.remember("missing", Known::Absent);
+        assert!(matches!(
+            rename(&fs, "missing", "missing"),
+            Reply::Error(libc::ENOENT)
+        ));
+    }
 
     const EMPTY_DIRECTORY: &str = "<ListBucketResult><Contents><Key>empty/</Key><Size>0</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>";
 
